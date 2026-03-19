@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pydantic
+psycopg2-binary
+lightgbm
+sentence-transformers
+numpy
+scikit-learn
+httpx
+sympy

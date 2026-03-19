@@ -1,0 +1,70 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  db:
+    image: timescale/timescaledb:latest-pg15
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-reasonops}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-reasonops_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-reasonops}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./backend/migrations:/docker-entrypoint-initdb.d
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reasonops"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-reasonops}:${POSTGRES_PASSWORD:-reasonops_pass}@db:5432/${POSTGRES_DB:-reasonops}
+      - OLLAMA_URL=http://ollama:11434
+    volumes:
+      - ./backend/app:/app/app
+    depends_on:
+      db:
+        condition: service_healthy
+    mem_limit: 1g
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    volumes:
+      - ./frontend/app:/app/app
+      - ./frontend/types:/app/types
+    depends_on:
+      - backend
+    mem_limit: 1g
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # VRAM BUDGET: Reserves the NVIDIA GPU for Ollama. 
+    # Ensures your RTX 4070 (8GB VRAM) is accessible for Q4_K_M quantized models.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  pgdata:
+  ollama_data:
