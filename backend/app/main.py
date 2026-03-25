@@ -1,6 +1,6 @@
 import time
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 from app.schemas.reasoning import (
     ReasoningRequest, 
@@ -13,19 +13,25 @@ from app.schemas.reasoning import (
 
 from app.core.complexity import ComplexityEstimator
 from app.core.policy import PolicyRouter
+from app.core.generator import LLMGenerator
+from app.core.verifier import VerificationEngine
 
 # Global instances loaded during startup
 ml_services = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Load ML models on startup
-    print("Initializing Complexity Estimator (loading SentenceTransformer and LightGBM)...")
+    print("Initializing ML Infrastructure...")
+
     ml_services["complexity_estimator"] = ComplexityEstimator()
     ml_services["policy_router"] = PolicyRouter()
-    print("ML Infrastructure loaded.")
+    ml_services["generator"] = LLMGenerator()
+    ml_services["verifier"] = VerificationEngine()
+
+    print("ML Infrastructure loaded:", ml_services.keys())
+
     yield
-    # Clean up on shutdown
+
     ml_services.clear()
 
 app = FastAPI(
@@ -49,73 +55,50 @@ async def health_check():
     return {"status": "ok", "service": "reasonops-backend"}
 
 @app.post("/api/v1/reason", response_model=ReasoningResponse)
+@app.post("/api/v1/reason", response_model=ReasoningResponse)
 async def reason_query(request: ReasoningRequest):
-    """
-    Phase 2 Endpoint.
-    Dynamically routes the request based on ML complexity estimation.
-    LLM output generation is still mocked until Phase 3.
-    """
     start_time = time.time()
     
-    # 1. Complexity Estimation (LightGBM + Embeddings)
+    # 1. Estimate & Route
     estimator: ComplexityEstimator = ml_services["complexity_estimator"]
     difficulty, risk = estimator.estimate(request.query)
     
-    # 2. Strategy Routing (Policy Engine)
     router: PolicyRouter = ml_services["policy_router"]
     selected_strategy = router.route(difficulty, risk, request.force_strategy)
     
-    # Simulate LLM/Verification processing time based on strategy selected
-    # Tree of thoughts is "slower" than direct
-    simulated_delay = {
-        StrategyEnum.DIRECT: 0.5,
-        StrategyEnum.SHORT_COT: 1.2,
-        StrategyEnum.LONG_COT: 2.5,
-        StrategyEnum.MULTI_SAMPLE: 3.0,
-        StrategyEnum.TREE_OF_THOUGHTS: 4.5,
-        StrategyEnum.EXTERNAL_SOLVER: 2.0
-    }.get(selected_strategy, 1.0)
+    # 2. Generate Structured LLM Output
+    generator: LLMGenerator = ml_services["generator"]
+    try:
+        llm_output = await generator.generate(request.query, selected_strategy)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM Generation failed: {str(e)}")
+        
+    # 3. Verify Output & Calculate Trust
+    verifier: VerificationEngine = ml_services["verifier"]
+    trust_score, flagged_indices = verifier.verify_and_score(llm_output, risk)
     
-    time.sleep(simulated_delay)
-    
-    trust = TrustScore(
-        logical_consistency=0.92,
-        evidence_alignment=0.88,
-        entropy=0.15,
-        contradiction_rate=0.0,
-        aggregate_score=max(0.0, 1.0 - risk) # Tie trust roughly to inverse risk for Phase 2
-    )
-    
-    steps =[
-        ReasoningStep(
-            step_index=1,
-            content=f"Evaluated query complexity. Difficulty: {difficulty:.2f}, Risk: {risk:.2f}",
-            assumptions=["Query is bounded and requires specific factual retrieval."],
-            entropy=0.01,
-            flagged=False
-        ),
-        ReasoningStep(
-            step_index=2,
-            content=f"Policy engine routed request to {selected_strategy.value}.",
-            assumptions=[],
-            entropy=0.02,
-            flagged=False
-        )
-    ]
-    
+    # Format steps
+    steps =[]
+    for s in llm_output.get("reasoning_steps",[]):
+        steps.append(ReasoningStep(
+            step_index=s.get("step_index", 0),
+            content=s.get("content", ""),
+            assumptions=s.get("assumptions",[]),
+            flagged=s.get("step_index") in flagged_indices
+        ))
+
     latency = int((time.time() - start_time) * 1000)
-    tokens = int(difficulty * 1000) + 50 # Heuristic mock token usage
     
     return ReasoningResponse(
-        final_answer=f"This response was routed using the {selected_strategy.value} strategy due to a complexity score of {difficulty:.2f}.",
-        confidence_score=0.95,
-        trust_score=trust,
+        final_answer=llm_output.get("final_answer", "No answer provided."),
+        confidence_score=trust_score.aggregate_score, # Binding confidence closely to trust for now
+        trust_score=trust_score,
         hallucination_risk=risk,
-        tokens_used=tokens,
+        tokens_used=llm_output.get("tokens_used", 0),
         latency_ms=latency,
         strategy_selected=selected_strategy,
         reasoning_steps=steps,
-        flagged_steps=[],
+        flagged_steps=flagged_indices,
         reasoning_graph=ReasoningGraph(nodes=[], edges=[])
     )
 

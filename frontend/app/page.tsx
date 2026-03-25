@@ -130,13 +130,22 @@ export default function ReasoningConsole() {
                                 <h3 className="text-gray-400 text-xs uppercase mb-4">Reasoning Trace</h3>
                                 <div className="space-y-4">
                                     {result.reasoning_steps.map((step) => (
-                                        <div key={step.step_index} className="flex gap-4 border-l-2 border-gray-700 pl-4">
-                                            <div className="text-gray-500 shrink-0 mt-0.5">[{step.step_index}]</div>
+                                        <div key={step.step_index} 
+                                             className={`flex gap-4 border-l-2 pl-4 ${step.flagged ? 'border-red-500 bg-red-900/10 p-2 rounded-r-md' : 'border-gray-700'}`}>
+                                            <div className={`${step.flagged ? 'text-red-400' : 'text-gray-500'} shrink-0 mt-0.5`}>[{step.step_index}]
+                                            </div>
                                             <div>
-                                                <p className="text-gray-300">{step.content}</p>
+                                                <p className={step.flagged ? 'text-red-200' : 'text-gray-300'}>
+                                                    {step.content}
+                                                </p>
                                                 {step.assumptions && step.assumptions.length > 0 && (
                                                     <div className="mt-2 text-xs text-gray-500 bg-gray-950 p-2 rounded border border-gray-800 inline-block">
                                                         <span className="font-semibold text-gray-400">Assumptions:</span> {step.assumptions.join(', ')}
+                                                    </div>
+                                                )}
+                                                {step.flagged && (
+                                                    <div className="mt-2 text-xs font-bold text-red-500 uppercase tracking-wider">
+                                                        ⚠️ Verification Failed (Math/Logic Error Detected)
                                                     </div>
                                                 )}
                                             </div>

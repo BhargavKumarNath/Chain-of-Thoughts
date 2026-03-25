@@ -1,5 +1,4 @@
 # docker-compose.yml
-version: '3.8'
 
 services:
   db:
@@ -28,11 +27,14 @@ services:
     environment:
       - DATABASE_URL=postgresql://${POSTGRES_USER:-reasonops}:${POSTGRES_PASSWORD:-reasonops_pass}@db:5432/${POSTGRES_DB:-reasonops}
       - OLLAMA_URL=http://ollama:11434
+      - LLM_MODEL=${LLM_MODEL:-llama3.2:3b}
     volumes:
       - ./backend/app:/app/app
     depends_on:
       db:
         condition: service_healthy
+      ollama-init:
+        condition: service_completed_successfully
     mem_limit: 1g
 
   frontend:
@@ -55,8 +57,7 @@ services:
       - "11434:11434"
     volumes:
       - ollama_data:/root/.ollama
-    # VRAM BUDGET: Reserves the NVIDIA GPU for Ollama. 
-    # Ensures your RTX 4070 (8GB VRAM) is accessible for Q4_K_M quantized models.
+    # VRAM BUDGET 
     deploy:
       resources:
         reservations:
@@ -64,6 +65,29 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+
+  ollama-init:
+    image: ollama/ollama:latest
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - LLM_MODEL=${LLM_MODEL:-llama3.2:3b}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        until ollama list >/dev/null 2>&1; do
+          echo "Waiting for Ollama API...";
+          sleep 2;
+        done;
+        if ollama list | grep -Eq "^${LLM_MODEL:-llama3.2:3b}[[:space:]]"; then
+          echo "Model ${LLM_MODEL:-llama3.2:3b} already present.";
+        else
+          echo "Pulling model ${LLM_MODEL:-llama3.2:3b}...";
+          ollama pull "${LLM_MODEL:-llama3.2:3b}";
+        fi
+    depends_on:
+      - ollama
+    restart: "no"
 
 volumes:
   pgdata:
