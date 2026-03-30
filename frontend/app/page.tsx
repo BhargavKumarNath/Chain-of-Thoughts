@@ -10,10 +10,7 @@ import {
     TraceListItem,
 } from '../types/reasoning';
 
-/* ------------------------------------------------------------------ */
 /*  Constants                                                          */
-/* ------------------------------------------------------------------ */
-
 const STRATEGY_OPTIONS = Object.values(StrategyEnum);
 
 const VERIFICATION_COLORS: Record<string, string> = {
@@ -29,10 +26,7 @@ const DIFFICULTY_COLORS: Record<string, string> = {
     HARD: 'bg-rose-500/20 text-rose-400',
 };
 
-/* ------------------------------------------------------------------ */
 /*  Helper Components                                                  */
-/* ------------------------------------------------------------------ */
-
 function Badge({ text, className }: { text: string; className: string }) {
     return (
         <span className={`px-2 py-0.5 rounded text-[11px] font-semibold uppercase tracking-wider border ${className}`}>
@@ -58,10 +52,7 @@ function Meter({ value, label, color }: { value: number; label: string; color: s
     );
 }
 
-/* ------------------------------------------------------------------ */
 /*  Main Console Page                                                  */
-/* ------------------------------------------------------------------ */
-
 export default function ReasoningConsole() {
     const [query, setQuery] = useState('');
     const [loading, setLoading] = useState(false);
