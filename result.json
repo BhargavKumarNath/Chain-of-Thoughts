@@ -2,15 +2,15 @@
   {
     "query": "What is 1+1?",
     "strategy": "SHORT_COT",
-    "hallucination_risk": 0.27674096245856394,
-    "latency": 1221,
-    "final_answer": "This response was routed using the SHORT_COT strategy due to a complexity score of 0.23."
+    "hallucination_risk": 0.2668948222585655,
+    "latency": 15359,
+    "final_answer": "The sum of 1 and 1 is 2."
   },
   {
     "query": "I need to understand the implications of quantum tunneling on modern semiconductor architecture, specifically referencing sub-2nm node constraints and potential material alternatives like graphene. Also, how does this relate to Moore's Law?",
     "strategy": "LONG_COT",
-    "hallucination_risk": 0.5996502207886685,
-    "latency": 2515,
-    "final_answer": "This response was routed using the LONG_COT strategy due to a complexity score of 0.75."
+    "hallucination_risk": 0.605747897415655,
+    "latency": 16719,
+    "final_answer": "The sub-2nm node constraints and quantum tunneling pose significant challenges for modern semiconductor architecture, but graphene-based transistors and other new materials and manufacturing techniques offer potential solutions to continue scaling down transistor sizes and maintaining Moore's Law."
   }
 ]
