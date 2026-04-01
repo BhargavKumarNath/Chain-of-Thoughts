@@ -21,6 +21,7 @@ from app.core.policy import PolicyRouter
 from app.core.generator import LLMGenerator
 from app.core.verifier import VerificationEngine
 from app.core.telemetry import TelemetryLogger
+from app.core.learning import PolicyLearner
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,7 @@ async def lifespan(app: FastAPI):
     ml_services["generator"] = LLMGenerator()
     ml_services["verifier"] = VerificationEngine()
     ml_services["telemetry"] = TelemetryLogger()
+    ml_services["learner"] = PolicyLearner()
 
     print("ML Infrastructure loaded:", ml_services.keys())
     yield
@@ -84,7 +86,7 @@ async def reason_query(request: ReasoningRequest, background_tasks: BackgroundTa
 
     # 2. Route strategy
     router: PolicyRouter = ml_services["policy_router"]
-    selected_strategy = router.route(difficulty, pre_risk, difficulty_level, request.force_strategy)
+    selected_strategy = router.route(request.query, difficulty, pre_risk, difficulty_level, request.force_strategy)
     _debug(f"Strategy selected: {selected_strategy.value}")
 
     # 3. Generate structured LLM output
@@ -100,8 +102,8 @@ async def reason_query(request: ReasoningRequest, background_tasks: BackgroundTa
     verifier: VerificationEngine = ml_services["verifier"]
     self_consistency_score = float(llm_output.get("_self_consistency_score", 0.0))
 
-    trust_score, flagged_indices, verification_status, verification_confidence, verification_details = (
-        verifier.verify_and_score(llm_output, pre_risk, self_consistency_score, query_type=query_type.value)
+    trust_score, completion_score, flagged_indices, verification_status, verification_confidence, verification_details = (
+        verifier.verify_and_score(request.query, llm_output, pre_risk, self_consistency_score, query_type=query_type.value)
     )
     _debug(f"Verification: status={verification_status.value}, confidence={verification_confidence:.3f}")
     _debug(f"Trust: aggregate={trust_score.aggregate_score:.3f}")
@@ -126,8 +128,8 @@ async def reason_query(request: ReasoningRequest, background_tasks: BackgroundTa
             if self_consistency_score > 0.5:
                 llm_output = sc_output
                 # Re-verify with the consensus output
-                trust_score, flagged_indices, verification_status, verification_confidence, verification_details = (
-                    verifier.verify_and_score(llm_output, pre_risk, self_consistency_score, query_type=query_type.value)
+                trust_score, completion_score, flagged_indices, verification_status, verification_confidence, verification_details = (
+                    verifier.verify_and_score(request.query, llm_output, pre_risk, self_consistency_score, query_type=query_type.value)
                 )
                 _debug(f"Post-SC verification: status={verification_status.value}, confidence={verification_confidence:.3f}")
         except Exception as e:
@@ -140,8 +142,8 @@ async def reason_query(request: ReasoningRequest, background_tasks: BackgroundTa
             _debug(f"Failure recovery: retrying with escalated strategy {escalated.value}")
             try:
                 retry_output = await generator.generate(request.query, escalated)
-                retry_trust, retry_flagged, retry_status, retry_conf, retry_details = (
-                    verifier.verify_and_score(retry_output, pre_risk, self_consistency_score, query_type=query_type.value)
+                retry_trust, retry_completion, retry_flagged, retry_status, retry_conf, retry_details = (
+                    verifier.verify_and_score(request.query, retry_output, pre_risk, self_consistency_score, query_type=query_type.value)
                 )
                 _debug(f"Retry verification: status={retry_status.value}, confidence={retry_conf:.3f}")
 
@@ -149,6 +151,7 @@ async def reason_query(request: ReasoningRequest, background_tasks: BackgroundTa
                 if retry_trust.aggregate_score > trust_score.aggregate_score:
                     llm_output = retry_output
                     trust_score = retry_trust
+                    completion_score = retry_completion
                     flagged_indices = retry_flagged
                     verification_status = retry_status
                     verification_confidence = retry_conf
@@ -168,6 +171,24 @@ async def reason_query(request: ReasoningRequest, background_tasks: BackgroundTa
         len(flagged_indices), len(llm_output.get("reasoning_steps", [])),
         query_type=query_type.value,
     )
+    
+    # Bug D & E Overrides
+    if llm_output.get("_divergence_flag"):
+        verification_status = VerificationStatusEnum.PARTIAL
+        verification_details.append(VerificationDetail(
+            method="multi_sample_consensus",
+            passed=False,
+            confidence=0.8,
+            message="Multiple reasoning samples diverged. Showing majority conclusion."
+        ))
+
+    if llm_output.get("_is_timeout"):
+        verification_status = VerificationStatusEnum.PARTIAL
+        step_count = len(llm_output.get("reasoning_steps", []))
+        capped_trust = min(0.45, 0.30 + (step_count * 0.05))
+        trust_score.aggregate_score = round(capped_trust, 4)
+        hallucination_risk = 0.6
+        
     _debug(f"Hallucination risk: {hallucination_risk:.3f}")
 
     # 8. Build response
@@ -199,6 +220,7 @@ async def reason_query(request: ReasoningRequest, background_tasks: BackgroundTa
         verification_confidence=round(verification_confidence, 4),
         verification_details=verification_details,
         confidence_score=trust_score.aggregate_score,
+        completion_score=completion_score,
         trust_score=trust_score,
         hallucination_risk=hallucination_risk,
         tokens_used=llm_output.get("tokens_used", 0),
@@ -211,9 +233,17 @@ async def reason_query(request: ReasoningRequest, background_tasks: BackgroundTa
         retry_strategy=retry_strategy,
     )
 
-    # 9. Log telemetry
+    # 9. Log telemetry and update contextual bandit
     telemetry: TelemetryLogger = ml_services["telemetry"]
-    background_tasks.add_task(telemetry.log_trace, request.query, response_obj)
+    learner: PolicyLearner = ml_services["learner"]
+    
+    def log_and_optimize():
+        try:
+            telemetry.log_trace(request.query, response_obj)
+        finally:
+            learner.optimize_policy()
+
+    background_tasks.add_task(log_and_optimize)
 
     return response_obj
 
@@ -257,3 +287,39 @@ async def delete_trace(trace_id: str):
 async def clear_all_traces():
     telemetry: TelemetryLogger = ml_services["telemetry"]
     return telemetry.delete_all_traces()
+
+@app.post("/api/v1/policy/optimize")
+async def optimize_policy():
+    learner: PolicyLearner = ml_services["learner"]
+    new_weights = learner.optimize_policy()
+    return {"status": "success", "policy": new_weights}
+
+
+@app.get("/api/v1/policy/weights")
+async def get_policy_weights():
+    learner: PolicyLearner = ml_services["learner"]
+    return learner.get_current_policy()
+
+
+@app.get("/api/v1/policy/reward-curves")
+async def get_reward_curves():
+    learner: PolicyLearner = ml_services["learner"]
+    return learner.get_reward_curves()
+
+
+@app.get("/api/v1/policy/ab-test")
+async def get_ab_test():
+    learner: PolicyLearner = ml_services["learner"]
+    return learner.simulate_ab_test()
+
+
+@app.get("/api/v1/policy/latency")
+async def get_latency_distribution():
+    learner: PolicyLearner = ml_services["learner"]
+    return learner.get_latency_distribution()
+
+
+@app.get("/api/v1/policy/strategy-performance")
+async def get_strategy_performance():
+    learner: PolicyLearner = ml_services["learner"]
+    return learner.get_strategy_performance()

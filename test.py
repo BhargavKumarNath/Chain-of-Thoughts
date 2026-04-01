@@ -1,26 +1,24 @@
 import urllib.request
 import json
+import time
 
-def test_query(q):
-    req = urllib.request.Request(
-        'http://localhost:8000/api/v1/reason', 
-        data=json.dumps({'query': q}).encode('utf-8'), 
-        headers={'Content-Type': 'application/json'}
-    )
-    res = urllib.request.urlopen(req).read().decode('utf-8')
-    data = json.loads(res)
-    return {
-        "query": q,
-        "strategy": data['strategy_selected'],
-        "hallucination_risk": data['hallucination_risk'],
-        "latency": data['latency_ms'],
-        "final_answer": data['final_answer']
-    }
+def post_query(q):
+    req = urllib.request.Request('http://localhost:8000/api/v1/reason', data=json.dumps({'query': q}).encode(), headers={'Content-Type': 'application/json'})
+    try:
+        r = urllib.request.urlopen(req)
+        return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return {'error': e.read()}
 
-results = [
-    test_query("What is 1+1?"),
-    test_query("I need to understand the implications of quantum tunneling on modern semiconductor architecture, specifically referencing sub-2nm node constraints and potential material alternatives like graphene. Also, how does this relate to Moore's Law?")
-]
+print('1. Testing Instruction Completion with: explain why the sky is blue')
+res1 = post_query('explain why the sky is blue')
+print(f"Strategy: {res1.get('strategy_selected')} Completion Score: {res1.get('completion_score')} Trust: {res1.get('trust_score', {}).get('aggregate_score')}")
 
-with open("result.json", "w") as f:
-    json.dump(results, f, indent=2)
+print('2. Testing Confidence Inversion Guard: solve this paradox: if Pinocchio says his nose will grow, will it?')
+res2 = post_query('solve this paradox: if Pinocchio says his nose will grow, will it?')
+print(f"Strategy: {res2.get('strategy_selected')} Conf: {res2.get('verification_confidence')} Level: {res2.get('difficulty_level')} Details: {[d['method'] for d in res2.get('verification_details', [])]}")
+
+print('3. Testing optimize policy')
+req_opt = urllib.request.Request('http://localhost:8000/api/v1/policy/optimize', data=b'', headers={'Content-Type': 'application/json'}, method='POST')
+opt_res = json.loads(urllib.request.urlopen(req_opt).read())
+print('Policy Weights:', json.dumps(opt_res['policy']['weights'], indent=2))

@@ -7,11 +7,7 @@ export const metadata: Metadata = {
   description: "Meta-reasoning orchestration layer",
 };
 
-export default function RootLayout({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
       <body className="bg-gray-950 text-gray-100 min-h-screen font-mono">
@@ -21,15 +17,14 @@ export default function RootLayout({
               <span className="font-bold text-blue-500 text-lg">ReasonOps</span>
               <div className="flex gap-4 text-sm">
                 <Link href="/" className="text-gray-400 hover:text-blue-400 transition-colors">Live Console</Link>
-                <Link href="/analytics" className="text-gray-400 hover:text-blue-400 transition-colors">Telemetry Dashboard</Link>
+                <Link href="/analytics" className="text-gray-400 hover:text-blue-400 transition-colors">Telemetry</Link>
+                <Link href="/policy" className="text-gray-400 hover:text-blue-400 transition-colors">Policy Engine</Link>
               </div>
             </div>
-            <div className="text-xs text-gray-600">v0.5.0</div>
+            <div className="text-xs text-gray-600">v0.6.0-alpha</div>
           </div>
         </nav>
-        <main>
-          {children}
-        </main>
+        <main>{children}</main>
       </body>
     </html>
   );

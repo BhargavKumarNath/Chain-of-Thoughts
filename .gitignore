@@ -1,2 +1,8 @@
 .venv/
 frontend/node_modules/
+ps.txt
+out3.txt
+output.txt
+test_out_utf8.txt
+test_out.txt
+test.py

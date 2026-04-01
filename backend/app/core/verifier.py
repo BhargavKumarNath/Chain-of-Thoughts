@@ -143,9 +143,24 @@ class VerificationEngine:
                             method="logical_consistency",
                             passed=False,
                             confidence=0.6,
-                            message=f"Potential contradiction between step {step_i} and step {step_j}: '{pos}' vs '{neg}' with shared context",
+                            message=f"Potential contradiction between step {step_i} and step {step_j}",
                         ))
                         break
+
+            # Circular Step Detection (Jaccard Similarity)
+            words_a = set(content_a.split())
+            words_b = set(content_b.split())
+            union = words_a | words_b
+            if union:
+                jaccard = len(words_a & words_b) / len(union)
+                if jaccard > 0.8:
+                    contradiction_count += 0.5  # Penalize circular reasoning
+                    details.append(VerificationDetail(
+                        method="circular_step",
+                        passed=False,
+                        confidence=0.8,
+                        message=f"High circularity (sim={jaccard:.2f}) between adjacent steps",
+                    ))
 
         # Assumption alignment: check if conclusions reference prior assumptions
         assumption_alignment = self._check_assumption_alignment(steps, soft=False)
@@ -318,41 +333,97 @@ class VerificationEngine:
         )
         return round(max(0.0, min(1.0, risk)), 4)
 
+    def _compute_instruction_completion(self, query: str, content: str) -> float:
+        """
+        Check if the final content adheres to explicit instructions in the query.
+        Returns a score 0.0 - 1.0. 
+        """
+        query_lower = query.lower()
+        content_lower = content.lower()
+        score = 1.0
+        penalties = 0.0
+
+        # Check for numeric constraints like "exactly 3" or "at least 2"
+        # Since it's heuristic, we just verify the presence of numbers or enumeration patterns
+        # if the query explicitly requested them.
+        import re
+        if "at least" in query_lower or "exactly" in query_lower or "identify" in query_lower:
+            # Check if there are lists, numbers, or bullet points in the answer
+            if not re.search(r'\d|\-|\*', content_lower):
+                penalties += 0.3
+
+        if "explain why" in query_lower or "justify" in query_lower:
+            if "because" not in content_lower and "therefore" not in content_lower and "since" not in content_lower:
+                penalties += 0.2
+                
+        if "acknowledge gaps" in query_lower or "limitations" in query_lower:
+            if "however" not in content_lower and "limit" not in content_lower and "gap" not in content_lower:
+                penalties += 0.3
+
+        return max(0.0, score - penalties)
+
     # Public API
     def verify_and_score(
         self,
+        query: str,
         llm_output: Dict[str, Any],
         pre_reasoning_risk: float,
         self_consistency_score: float = 0.0,
         query_type: str = "SEMI_STRUCTURED",
-    ) -> Tuple[TrustScore, List[int], VerificationStatusEnum, float, List[VerificationDetail]]:
+    ) -> Tuple[TrustScore, float, List[int], VerificationStatusEnum, float, List[VerificationDetail]]:
         """
         Full verification pipeline. Returns:
-        (trust_score, flagged_indices, verification_status, verification_confidence, verification_details)
+        (trust_score, completion_score, flagged_indices, verification_status, verification_confidence, verification_details)
 
         Safe fallback: any internal failure returns conservative scores, never raises.
         """
         try:
-            return self._verify_and_score_inner(llm_output, pre_reasoning_risk, self_consistency_score, query_type)
+            return self._verify_and_score_inner(query, llm_output, pre_reasoning_risk, self_consistency_score, query_type)
         except Exception as exc:
             logger.error("Verification pipeline crashed (safe fallback): %s", exc, exc_info=True)
             return self._fallback_result(pre_reasoning_risk)
 
     def _verify_and_score_inner(
         self,
+        query: str,
         llm_output: Dict[str, Any],
         pre_reasoning_risk: float,
         self_consistency_score: float,
         query_type: str = "SEMI_STRUCTURED",
-    ) -> Tuple[TrustScore, List[int], VerificationStatusEnum, float, List[VerificationDetail]]:
+    ) -> Tuple[TrustScore, float, List[int], VerificationStatusEnum, float, List[VerificationDetail]]:
         """Core verification logic, wrapped by safe fallback in verify_and_score."""
 
         steps = llm_output.get("reasoning_steps", [])
         final_answer = str(llm_output.get("final_answer", ""))
+        all_text = " ".join(str(s.get("content", "")) for s in steps) + " " + final_answer
+        
+        # Bug E: If LLM output is totally empty/busted
+        if not steps and not final_answer:
+            trust = TrustScore(
+                verification_confidence=0.0,
+                reasoning_consistency_score=0.0,
+                self_consistency_score=0.0,
+                aggregate_score=0.10,  # 10% Trust
+                logical_consistency=0.0,
+                evidence_alignment=0.0,
+                entropy=0.80, # 80% Risk
+                contradiction_rate=0.0,
+            )
+            return trust, 0.0, [], VerificationStatusEnum.FAILED, 0.0, [
+                VerificationDetail(
+                    method="schema_check",
+                    passed=False,
+                    confidence=1.0,
+                    message="LLM generated zero valid reasoning steps and empty final answer.",
+                )
+            ]
+            
+        completion_score = self._compute_instruction_completion(query, all_text)
 
         # OPEN_ENDED path: heuristic evaluation (no strict verification)
         if query_type == "OPEN_ENDED":
-            return self._heuristic_evaluate(steps, final_answer, self_consistency_score)
+            trust, flagged, status, conf, details = self._heuristic_evaluate(query, steps, final_answer, self_consistency_score)
+            return trust, completion_score, flagged, status, conf, details
 
         # DETERMINISTIC / SEMI_STRUCTURED path: strict verification
         # 1. Mathematical verification
@@ -369,7 +440,17 @@ class VerificationEngine:
             math_details, consistency_score
         )
 
-        # 4. Trust score
+        # 4. Confidence Inversion Guard
+        uncertainty_markers = ["paradox", "bias", "unknown", "cannot detect", "dilemma", "uncertain"]
+        if any(m in query.lower() for m in uncertainty_markers) and verification_confidence > 0.8:
+            verification_confidence = 0.8  # Cap confidence for highly uncertain prompts
+            all_details.append(VerificationDetail(
+                method="confidence_inversion_guard",
+                passed=False,
+                message="Confidence ceiling lowered due to high uncertainty/paradox language in query"
+            ))
+
+        # 5. Trust score
         trust = self._compute_trust(
             verification_confidence, verification_status,
             consistency_score, self_consistency_score,
@@ -385,11 +466,12 @@ class VerificationEngine:
         # Override the trust entropy with hallucination risk for consistency
         trust.entropy = hallucination_risk
 
-        return trust, flagged_indices, verification_status, verification_confidence, all_details
+        return trust, completion_score, flagged_indices, verification_status, verification_confidence, all_details
 
     # OPEN_ENDED heuristic evaluation
     def _heuristic_evaluate(
         self,
+        query: str,
         steps: List[Dict[str, Any]],
         final_answer: str,
         self_consistency_score: float,
@@ -397,26 +479,57 @@ class VerificationEngine:
         """
         Heuristic evaluation for open-ended / conceptual queries.
         Computes: coverage_score, coherence_score, plausibility_score.
-        Never returns FAILED — returns HEURISTIC status.
+        Checks for evasion and caps trust accordingly.
         """
         details: List[VerificationDetail] = []
+        
+        all_text = " ".join(str(s.get("content", "")) for s in steps) + " " + final_answer
+        all_text_lower = all_text.lower()
+        query_lower = query.lower()
+
+        # 1. Evasion check
+        evasion_keywords = ["i am a machine learning model", "i cannot", "as an ai", "i am an ai model", "i do not have", "i'm just an ai"]
+        is_evasive = False
+        if any(kw in all_text_lower for kw in evasion_keywords) and len(all_text) < 300:
+            is_evasive = True
+            
+        if is_evasive:
+            details.append(VerificationDetail(
+                method="evasion_check",
+                passed=False,
+                confidence=0.9,
+                message="Output contained deflection/evasion phrases without substantive content",
+            ))
 
         # Coverage: did the answer address all parts?
         step_count = len(steps)
-        total_content_len = sum(len(str(s.get("content", ""))) for s in steps) + len(final_answer)
-        # Heuristic: longer, multi-step answers generally have better coverage
-        if step_count >= 3 and total_content_len > 200:
-            coverage_score = min(1.0, 0.7 + (step_count / 20.0))
-        elif step_count >= 2:
-            coverage_score = 0.65
-        else:
-            coverage_score = 0.4
+        total_content_len = len(all_text)
+        
+        import re
+        clauses = re.split(r'[,;]|\n-|\*', query_lower)
+        clauses = [c.strip() for c in clauses if len(c.strip()) > 5]
+        
+        addressed = 0
+        for clause in clauses:
+            words = set(w for w in clause.split() if len(w) > 4)
+            if words and any(w in all_text_lower for w in words):
+                addressed += 1
+                
+        completeness_ratio = addressed / max(len(clauses), 1)
+        
+        # Main verb/task missing penalty
+        main_tasks = ["construct", "produce", "list", "explain", "justify", "summarize", "derive"]
+        task_missing = any(t in query_lower and t not in all_text_lower for t in main_tasks)
+        
+        coverage_score = min(1.0, 0.4 + completeness_ratio * 0.6)
+        if task_missing:
+            coverage_score = min(coverage_score, 0.6)
 
         details.append(VerificationDetail(
             method="heuristic_coverage",
             passed=coverage_score >= 0.5,
             confidence=coverage_score,
-            message=f"Coverage: {step_count} reasoning steps, {total_content_len} chars total",
+            message=f"Coverage ratio {completeness_ratio:.2f}; Task missing: {task_missing}",
         ))
 
         # Coherence: step-to-step flow (soft contradiction check)
@@ -461,11 +574,19 @@ class VerificationEngine:
         )
 
         # Trust: different weights for open-ended
-        aggregate = round(
-            coverage_score * 0.4 + coherence_score * 0.3 + plausibility_score * 0.3,
-            4,
-        )
-        aggregate = max(0.0, min(1.0, aggregate))
+        if is_evasive:
+            aggregate = 0.4  # Hard cap
+            status = VerificationStatusEnum.FAILED
+        else:
+            aggregate = round(
+                coverage_score * 0.4 + coherence_score * 0.3 + plausibility_score * 0.3,
+                4,
+            )
+            # Cap trust at 0.6 if main task missing
+            if task_missing:
+                aggregate = min(aggregate, 0.6)
+            aggregate = max(0.0, min(1.0, aggregate))
+            status = VerificationStatusEnum.HEURISTIC
 
         trust = TrustScore(
             verification_confidence=verification_confidence,
@@ -478,11 +599,11 @@ class VerificationEngine:
             contradiction_rate=round(max(0.0, 1.0 - coherence_score), 4),
         )
 
-        return trust, [], VerificationStatusEnum.HEURISTIC, verification_confidence, details
+        return trust, [], status, verification_confidence, details
 
     def _fallback_result(
         self, pre_reasoning_risk: float
-    ) -> Tuple[TrustScore, List[int], VerificationStatusEnum, float, List[VerificationDetail]]:
+    ) -> Tuple[TrustScore, float, List[int], VerificationStatusEnum, float, List[VerificationDetail]]:
         """Conservative safe fallback when the verification pipeline itself fails."""
         trust = TrustScore(
             verification_confidence=0.0,
@@ -500,4 +621,4 @@ class VerificationEngine:
             confidence=0.0,
             message="Verification pipeline encountered an internal error; conservative scores applied",
         )]
-        return trust, [], VerificationStatusEnum.PARTIAL, 0.0, details
+        return trust, 0.5, [], VerificationStatusEnum.PARTIAL, 0.0, details

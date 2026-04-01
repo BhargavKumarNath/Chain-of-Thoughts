@@ -15,6 +15,12 @@ DB_URL = os.getenv("DATABASE_URL", "postgresql://reasonops:reasonops_pass@db:543
 class TelemetryLogger:
     def __init__(self):
         self._schema_ensured = False
+        try:
+            # Force schema check on init so other services can query safely
+            with self._get_connection() as conn:
+                pass
+        except Exception as e:
+            logger.error(f"Failed to initialize schema during TelemetryLogger init: {e}")
 
     def _get_connection(self):
         conn = psycopg2.connect(DB_URL)
@@ -23,10 +29,10 @@ class TelemetryLogger:
         return conn
 
     def _ensure_schema(self, conn):
-        """Auto-apply v0.5 schema migration for existing databases."""
+        """Auto-apply schema migrations for existing databases."""
         try:
             with conn.cursor() as cur:
-                # Check if new columns exist, if not add them
+                # Check if verification_status exists
                 cur.execute("""
                     SELECT column_name FROM information_schema.columns
                     WHERE table_name = 'requests' AND column_name = 'verification_status'
@@ -42,8 +48,20 @@ class TelemetryLogger:
                     """)
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_requests_verification_status ON requests(verification_status)")
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_requests_difficulty_level ON requests(difficulty_level)")
+                
+                # Check for completion_score individually
+                cur.execute("""
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_name = 'requests' AND column_name = 'completion_score'
+                """)
+                if not cur.fetchone():
+                    logger.info("Applying completion_score migration...")
+                    cur.execute("""
+                        ALTER TABLE requests ADD COLUMN IF NOT EXISTS completion_score FLOAT DEFAULT 1.0;
+                    """)
                     conn.commit()
-                    logger.info("v0.5 schema migration applied successfully")
+                else:
+                    conn.commit()
             self._schema_ensured = True
         except Exception as e:
             logger.error(f"Schema migration check failed: {e}")
@@ -58,8 +76,8 @@ class TelemetryLogger:
                         INSERT INTO requests (
                             query, strategy_selected, hallucination_risk, confidence_score,
                             trust_score, tokens_used, latency_ms, final_answer,
-                            verification_status, verification_confidence, difficulty_level, retry_used
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
+                            verification_status, verification_confidence, difficulty_level, retry_used, completion_score
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
                     """, (
                         query,
                         response.strategy_selected.value,
@@ -73,6 +91,7 @@ class TelemetryLogger:
                         response.verification_confidence,
                         response.difficulty_level.value if response.difficulty_level else None,
                         response.retry_used,
+                        response.completion_score,
                     ))
                     request_id = cur.fetchone()[0]
 
@@ -178,7 +197,7 @@ class TelemetryLogger:
                         SELECT id, query, strategy_selected, hallucination_risk,
                                confidence_score, trust_score, tokens_used, latency_ms,
                                final_answer, verification_status, verification_confidence,
-                               difficulty_level, retry_used, created_at
+                               difficulty_level, retry_used, completion_score, created_at
                         FROM requests WHERE id = %s
                     """, (trace_id,))
                     request_row = cur.fetchone()

@@ -26,17 +26,33 @@ _MULTI_STEP_KEYWORDS = {
     "given that", "if", "assuming", "provided that", "such that",
     "find the probability", "find the value", "calculate", "compute",
     "determine", "evaluate", "derive", "prove", "show that",
+    "at least", "exactly", "identify", "compare", "contrast", "differentiate between"
 }
 
 _HARD_MARKERS = {
-    "optimize", "maximize", "minimize", "optimal", "argmax", "argmin",
     "prove", "disprove", "bayesian", "conditional probability",
-    "multiple constraints", "subject to", "lagrangian", "dynamic programming",
+    "subject to", "lagrangian", "dynamic programming",
     "integrate", "differentiate", "eigenvalue", "matrix",
+    "virtue ethics", "deontological", "utilitarian", "perspectives", "frameworks",
+    "counterfactual", "recursive", "second-order", "third-order",
+    "uncertainty", "dilemma"
+}
+
+_VERY_HARD_MARKERS = {
+    "schedule", "optimize", "allocate", "minimize makespan", 
+    "maximize", "minimize", "optimal", "argmax", "argmin",
+    "np-hard", "combinatorial", "traveling salesperson"
+}
+
+_DOMAIN_MARKERS = {
+    "medical", "patient", "diagnosis", "clinical",
+    "legal", "lawsuit", "jurisdiction", "statute",
+    "financial", "portfolio", "investment", "interest rate"
 }
 
 _MATH_OPERATORS = re.compile(r"[\+\-\*×÷/\^=\(\)]")
 _NUMERIC_PATTERN = re.compile(r"\d+\.?\d*")
+_CONSTRAINT_PATTERN = re.compile(r"constraint|rule|condition|requirement")
 
 
 class ComplexityEstimator:
@@ -83,13 +99,12 @@ class ComplexityEstimator:
         # Combine (4 + 384 = 388 features)
         return np.concatenate([structural_features, semantic_features])
 
-    def _compute_keyword_signals(self, query: str) -> Tuple[float, float, float]:
+    def _compute_keyword_signals(self, query: str) -> Tuple[float, float, float, float, bool]:
         """
         Compute complexity signals from query keywords.
-        Returns (math_signal, multi_step_signal, hard_signal) each in [0, 1].
+        Returns (math_signal, multi_step_signal, hard_signal, very_hard_signal, is_paradox) each in [0, 1] plus a boolean paradox flag.
         """
         query_lower = query.lower()
-        words = set(query_lower.split())
 
         # Math presence: operators and numbers
         math_operator_count = len(_MATH_OPERATORS.findall(query))
@@ -102,18 +117,41 @@ class ComplexityEstimator:
 
         # Hard problem markers
         hard_count = sum(1 for kw in _HARD_MARKERS if kw in query_lower)
+        
+        # Self-referential or paradoxical
+        is_paradox = False
+        if "itself" in query_lower or "its own" in query_lower or "paradox" in query_lower or "self-reference" in query_lower or "flags itself" in query_lower or "if and only if" in query_lower:
+            hard_count += 2
+            is_paradox = True
+            
+        # Constraints >= 3
+        constraint_count = len(_CONSTRAINT_PATTERN.findall(query_lower))
+        if constraint_count >= 3:
+            hard_count += 2
+            
+        # Domain tags + multi-variable (simulated by multi_step or constraints)
+        domain_count = sum(1 for kw in _DOMAIN_MARKERS if kw in query_lower)
+        if domain_count > 0 and (constraint_count > 0 or multi_step_count > 0):
+            hard_count += 2
+
         hard_signal = min(1.0, hard_count / 2.0)
+        
+        # Very hard markers
+        very_hard_count = sum(1 for kw in _VERY_HARD_MARKERS if kw in query_lower)
+        very_hard_signal = min(1.0, very_hard_count / 1.0)
 
-        return math_signal, multi_step_signal, hard_signal
+        return math_signal, multi_step_signal, hard_signal, very_hard_signal, is_paradox
 
-    def classify_difficulty(self, difficulty_score: float) -> DifficultyLevel:
+    def classify_difficulty(self, difficulty_score: float, word_count: int = 0) -> DifficultyLevel:
         """Classify continuous difficulty score into categorical level."""
-        if difficulty_score < 0.25:
-            return DifficultyLevel.EASY
-        elif difficulty_score < 0.65:
+        if difficulty_score >= 0.85 or (difficulty_score >= 0.65 and word_count >= 80):
+            return DifficultyLevel.VERY_HARD
+        elif difficulty_score >= 0.65:
+            return DifficultyLevel.HARD
+        elif difficulty_score >= 0.25:
             return DifficultyLevel.MEDIUM
         else:
-            return DifficultyLevel.HARD
+            return DifficultyLevel.EASY
 
     def classify_query_type(self, query: str) -> QueryTypeEnum:
         """
@@ -167,13 +205,17 @@ class ComplexityEstimator:
         base_score = float(np.clip(pred, 0.0, 1.0))
 
         # Keyword-based adjustment
-        math_signal, multi_step_signal, hard_signal = self._compute_keyword_signals(query)
+        math_signal, multi_step_signal, hard_signal, very_hard_signal, is_paradox = self._compute_keyword_signals(query)
 
         # Combine LightGBM score with keyword signals
         difficulty = float(np.clip(
-            base_score * 0.5 + math_signal * 0.15 + multi_step_signal * 0.2 + hard_signal * 0.15,
+            base_score * 0.5 + math_signal * 0.15 + multi_step_signal * 0.2 + hard_signal * 0.15 + very_hard_signal * 0.3,
             0.0, 1.0
         ))
+        
+        # Bug 4 Override - Hard Ceiling for Paradoxes
+        if is_paradox:
+             difficulty = max(0.80, difficulty)
 
         # Risk: correlated with difficulty, spikes on short vague queries
         word_count = len(query.split())
@@ -182,7 +224,7 @@ class ComplexityEstimator:
         else:
             risk = float(np.clip(difficulty * 0.8, 0.0, 1.0))
 
-        difficulty_level = self.classify_difficulty(difficulty)
+        difficulty_level = self.classify_difficulty(difficulty, word_count)
 
         return difficulty, risk, difficulty_level
 

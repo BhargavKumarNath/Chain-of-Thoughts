@@ -20,7 +20,7 @@ class LLMReasoningStepPayload(BaseModel):
 
 
 class LLMReasoningPayload(BaseModel):
-    reasoning_steps: List[LLMReasoningStepPayload] = Field(..., min_length=1)
+    reasoning_steps: List[LLMReasoningStepPayload] = Field(default_factory=list)
     final_answer: str = Field(..., min_length=1)
 
 
@@ -36,15 +36,15 @@ class LLMGenerator:
         self.model = os.getenv("LLM_MODEL", "llama3.2:3b")
         self.timeout_seconds = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "120"))
         self.base_num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
-        self.multi_sample_n = max(1, int(os.getenv("MULTI_SAMPLE_N", "2")))
+        self.multi_sample_n = 3  # Forced to 3 for MULTI_SAMPLE
 
     # Dynamic context / token limits per strategy
     _CTX_LIMITS = {
-        StrategyEnum.DIRECT: 2048,
-        StrategyEnum.SHORT_COT: 3072,
-        StrategyEnum.LONG_COT: 4096,
-        StrategyEnum.TREE_OF_THOUGHTS: 4096,
-        StrategyEnum.MULTI_SAMPLE: 3072,
+        StrategyEnum.DIRECT: 200,
+        StrategyEnum.SHORT_COT: 500,
+        StrategyEnum.LONG_COT: 1500,
+        StrategyEnum.TREE_OF_THOUGHTS: 2000,
+        StrategyEnum.MULTI_SAMPLE: 500,
         StrategyEnum.EXTERNAL_SOLVER: 3072,
     }
 
@@ -54,27 +54,30 @@ class LLMGenerator:
     def _build_system_prompt(self, strategy: StrategyEnum) -> str:
         strategy_hint = {
             StrategyEnum.DIRECT: (
-                "Answer directly in 1-2 concise steps. "
+                "Answer directly with 0 reasoning steps. 'reasoning_steps' array MUST be empty []. "
                 "The final_answer must be a clear, complete sentence."
             ),
             StrategyEnum.SHORT_COT: (
-                "Produce a short chain of reasoning with 2-4 steps. "
+                "Produce a short chain of reasoning with exactly 2 to 5 steps max. "
                 "The final_answer must be a complete sentence summarising the conclusion."
             ),
             StrategyEnum.LONG_COT: (
-                "Use a thorough, step-by-step chain of reasoning. "
-                "Each step must build logically on the previous one. "
+                "Use a thorough, step-by-step chain of reasoning (max 15 steps). "
+                "Each step must build logically on the previous one without circular repetition. "
+                "Address second-order effects fully before proceeding to third-order effects. Proceed strictly by analytical depth. "
                 "For optimisation or allocation problems, compute exact quantities per entity and verify the total adds up. "
                 "For probabilistic problems, show each intermediate probability and state the formula used. "
                 "The final_answer must be a self-contained, fully explained conclusion — "
                 "never just a bare number. It must restate what the answer means in context."
             ),
             StrategyEnum.TREE_OF_THOUGHTS: (
-                "Consider at least two candidate approaches before committing to the best one. "
+                "Consider at least two candidate approaches before committing. Branching factor <= 3, depth <= 4. "
+                "Each branch must be explicitly labeled with its decision node (e.g., `[Branch: <path name>]`). "
+                "Steps within a branch must progress firmly toward that branch's terminal outcome. "
                 "The final_answer must clearly state which approach was chosen and why."
             ),
             StrategyEnum.MULTI_SAMPLE: (
-                "Produce one high-quality reasoning sample. "
+                "Produce one high-quality reasoning sample with max 5 steps. "
                 "The final_answer must be a complete, standalone answer."
             ),
             StrategyEnum.EXTERNAL_SOLVER: (
@@ -94,10 +97,11 @@ class LLMGenerator:
             '  "final_answer": "string"\n'
             "}\n"
             "Rules:\n"
-            "- reasoning_steps must be a non-empty array of at least 2 items.\n"
             "- step_index must start at 1 and increase by 1.\n"
             "- assumptions must always be an array (empty array [] is fine, never omit it).\n"
             "- final_answer must NEVER be empty or a single bare number without context.\n"
+            "- Each step MUST introduce a new constraint/variable OR logically resolve a previous one. DO NOT merely restate prior conclusions.\n"
+            "- If the query involves scheduling, assignment, or resource allocation: Step 1 MUST strictly enumerate ONLY the explicit entities (e.g., Tasks A-K, Workers 1-4) named in the prompt. Treat this as a strictly closed world. Tasks MUST be distributed in parallel across available workers simultaneously, NOT assigned sequentially to a single worker.\n"
             f"- {strategy_hint}\n"
         )
 
@@ -111,32 +115,67 @@ class LLMGenerator:
             return LLMReasoningPayload.model_validate(payload)
         return LLMReasoningPayload.parse_obj(payload)
 
-    def _extract_json_candidate(self, raw_content: str) -> Dict[str, Any]:
+    def _extract_json_lenient(self, raw_content: str) -> Dict[str, Any]:
+        """Tries to extract JSON, or forces extraction of steps via regex if severely broken."""
         raw_content = (raw_content or "").strip()
         if not raw_content:
-            raise json.JSONDecodeError("Empty content", "", 0)
-
+            raise ValueError("Empty content")
+            
         try:
             return json.loads(raw_content)
         except json.JSONDecodeError:
             pass
-
+            
+        # Try standard cleanup
         no_fence = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_content, flags=re.IGNORECASE | re.DOTALL).strip()
-        if no_fence and no_fence != raw_content:
+        if no_fence:
             try:
                 return json.loads(no_fence)
             except json.JSONDecodeError:
                 pass
-
+            
+        # Try finding the largest valid JSON block
         first_brace = no_fence.find("{")
         last_brace = no_fence.rfind("}")
         if first_brace != -1 and last_brace != -1 and first_brace < last_brace:
-            sliced = no_fence[first_brace:last_brace + 1]
-            return json.loads(sliced)
+            try:
+                return json.loads(no_fence[first_brace:last_brace + 1])
+            except json.JSONDecodeError:
+                pass
+                
+        # --- Extreme Lenient Parsing (Regex Fallback) ---
+        # If we reached here, JSON is broken (likely truncated from timeout).
+        extracted_steps = []
+        matches = re.finditer(r'"content"\s*:\s*"((?:[^"\\]|\\.)*)"', raw_content)
+        for i, match in enumerate(matches, 1):
+            val = match.group(1).replace('\\"', '"').replace('\\n', '\n')
+            extracted_steps.append({
+                "step_index": i,
+                "content": val,
+                "assumptions": []
+            })
+            
+        # Try to find a final answer
+        final_ans = "Partial generation - final answer not reached."
+        ans_match = re.search(r'"final_answer"\s*:\s*"((?:[^"\\]|\\.)*)"', raw_content)
+        if ans_match:
+            final_ans = ans_match.group(1).replace('\\"', '"').replace('\\n', '\n')
+            
+        if not extracted_steps and not ans_match:
+            # Maybe the whole output is just plain text? Wrap it.
+            clean_text = raw_content[:1000] + "..." if len(raw_content) > 1000 else raw_content
+            extracted_steps.append({
+                "step_index": 1,
+                "content": clean_text,
+                "assumptions": []
+            })
+            
+        return {
+            "reasoning_steps": extracted_steps,
+            "final_answer": final_ans
+        }
 
-        raise json.JSONDecodeError("Unable to extract JSON object", raw_content, 0)
-
-    def _normalize_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _normalize_payload(self, payload: Dict[str, Any], query: str = "") -> Dict[str, Any]:
         normalized: Dict[str, Any] = {}
 
         steps = payload.get("reasoning_steps")
@@ -173,7 +212,69 @@ class LLMGenerator:
                     }
                 )
 
-        normalized["reasoning_steps"] = step_items
+        def jaccard_similarity(s1: str, s2: str) -> float:
+            set1 = set(s1.lower().split())
+            set2 = set(s2.lower().split())
+            if not set1 or not set2:
+                return 0.0
+            return len(set1.intersection(set2)) / len(set1.union(set2))
+
+        # Hallucination Guard Prep
+        is_scheduling = any(kw in query.lower() for kw in ["schedule", "makespan", "allocate", "assign"])
+        illegal_entities = []
+        if is_scheduling:
+            q_upper = query.upper()
+            for i in range(ord('A'), ord('Z') + 1):
+                letter = chr(i)
+                if not re.search(r'\b' + letter + r'\b', q_upper):
+                    illegal_entities.append(f"Task {letter}")
+                    illegal_entities.append(f"task {letter.lower()}")
+            for i in range(5, 20):
+                if str(i) not in query:
+                    illegal_entities.append(f"Worker {i}")
+                    illegal_entities.append(f"worker {i}")
+
+        filtered_steps = []
+        redundant_streak = 0
+        loop_halted = False
+
+        for step in step_items:
+            if loop_halted:
+                break
+            content = step["content"]
+            
+            # Bug 1 Hallucination Guard
+            if is_scheduling and not loop_halted:
+                hallucinated = False
+                for illegal in illegal_entities:
+                    if illegal in content:
+                        hallucinated = True
+                        break
+                if hallucinated:
+                    step["content"] = "[HALLUCINATED] " + content
+                    loop_halted = True
+                    final_answer = "[HALLUCINATED] Unknown entity introduced. Halting trace."
+                    filtered_steps.append(step)
+                    continue
+
+            is_redundant = False
+            for prev_step in filtered_steps:
+                if jaccard_similarity(content, prev_step["content"]) > 0.85:
+                    is_redundant = True
+                    break
+            
+            if is_redundant:
+                step["content"] = "[REDUNDANT] " + content
+                redundant_streak += 1
+                if redundant_streak >= 3:
+                    loop_halted = True
+                    final_answer = "[REASONING_LOOP_DETECTED] " + str(final_answer)
+            else:
+                redundant_streak = 0
+            
+            filtered_steps.append(step)
+
+        normalized["reasoning_steps"] = filtered_steps
         normalized["final_answer"] = str(final_answer or "").strip()
         return normalized
 
@@ -205,7 +306,6 @@ class LLMGenerator:
         self, query: str, strategy: StrategyEnum, sample_index: int = 0
     ) -> Dict[str, Any]:
         num_ctx = self._get_num_ctx(strategy)
-
         payload = {
             "model": self.model,
             "messages": [
@@ -213,34 +313,77 @@ class LLMGenerator:
                 {"role": "user", "content": query},
             ],
             "format": "json",
-            "stream": False,
+            "stream": True,
             "options": {
                 "temperature": self._temperature_for(strategy, sample_index),
                 "num_ctx": num_ctx,
+                "num_predict": num_ctx,
             },
         }
 
-        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+        timeout_map = {
+            StrategyEnum.DIRECT: 5.0,
+            StrategyEnum.SHORT_COT: 10.0,
+            StrategyEnum.LONG_COT: 90.0,
+            StrategyEnum.TREE_OF_THOUGHTS: 120.0,
+            StrategyEnum.MULTI_SAMPLE: 45.0,
+            StrategyEnum.EXTERNAL_SOLVER: 60.0,
+        }
+        request_timeout = timeout_map.get(strategy, self.timeout_seconds)
+
+        raw_content = ""
+        tokens_used = 0
+        is_timeout = False
+
+        async with httpx.AsyncClient(timeout=request_timeout) as client:
             try:
-                response = await client.post(f"{self.base_url}/api/chat", json=payload)
-                response.raise_for_status()
-                data = response.json()
+                async with client.stream("POST", f"{self.base_url}/api/chat", json=payload) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if not line:
+                            continue
+                        try:
+                            chunk = json.loads(line)
+                            raw_content += chunk.get("message", {}).get("content", "")
+                            if chunk.get("done"):
+                                tokens_used = chunk.get("eval_count", 0) + chunk.get("prompt_eval_count", 0)
+                        except json.JSONDecodeError:
+                            pass
+            except httpx.ReadTimeout:
+                logger.warning(f"Ollama timeout at {request_timeout}s. Stored {len(raw_content)} chars.")
+                is_timeout = True
+                if not raw_content.strip():
+                    return self._fallback_payload("[TIMEOUT] Generation hit latency ceiling with no output.", tokens_used=num_ctx)
             except httpx.HTTPError as exc:
                 logger.error("Ollama API error: %s", exc)
-                return self._fallback_payload("ollama_http_error")
+                return self._fallback_payload("ollama_http_error", tokens_used=0)
 
-        tokens_used = int((data or {}).get("eval_count", 0) or 0) + int((data or {}).get("prompt_eval_count", 0) or 0)
-        raw_content = ((data or {}).get("message") or {}).get("content", "")
-
+        # Bug B & C: Use lenient parsing and don't strict-fail on ValidationError
         try:
-            extracted = self._extract_json_candidate(raw_content)
-            normalized = self._normalize_payload(extracted)
-            validated = self._validate_payload(normalized)
-            structured = self._dump_model(validated)
-            structured["tokens_used"] = tokens_used
+            extracted = self._extract_json_lenient(raw_content)
+            normalized = self._normalize_payload(extracted, query)
+            
+            structured = {
+                "reasoning_steps": normalized.get("reasoning_steps", []),
+                "final_answer": normalized.get("final_answer", ""),
+                "tokens_used": tokens_used or num_ctx
+            }
+            
+            if not structured["reasoning_steps"] and not structured["final_answer"].strip():
+                 return self._fallback_payload("empty_or_broken_output", tokens_used)
+                 
+            if is_timeout:
+                step_count = len(structured["reasoning_steps"])
+                structured["reasoning_steps"].append({
+                    "step_index": step_count + 1,
+                    "content": f"[TIMEOUT] Generation halted at step {step_count} — partial trace shown above.",
+                    "assumptions": []
+                })
+                structured["_is_timeout"] = True
+                
             return structured
-        except (json.JSONDecodeError, ValidationError, ValueError, TypeError) as exc:
-            logger.warning("Invalid structured LLM output (sample %s): %s", sample_index, exc)
+        except Exception as exc:
+            logger.warning("Invalid raw LLM output (sample %s): %s", sample_index, exc)
             return self._fallback_payload("schema_validation_failed", tokens_used=tokens_used)
 
     def _choose_consensus_candidate(self, candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -311,9 +454,49 @@ class LLMGenerator:
 
         self_consistency = self.compute_self_consistency_score(candidates)
         selected = self._choose_consensus_candidate(candidates)
+        
+        # Merge sample traces into one unified list for UI observation
+        merged_steps = []
+        for i, cand in enumerate(candidates, 1):
+            cand_steps = cand.get("reasoning_steps", [])
+            merged_steps.append({
+                "step_index": len(merged_steps) + 1,
+                "content": f"[Sample {i}] started",
+                "assumptions": []
+            })
+            for s in cand_steps:
+               s_copy = dict(s)
+               s_copy["step_index"] = len(merged_steps) + 1
+               merged_steps.append(s_copy)
+
         selected["tokens_used"] = total_tokens
         selected["_self_consistency_score"] = self_consistency
         selected["_all_candidates"] = candidates
+        
+        # Surface divergence flag
+        if self_consistency < 1.0:
+            selected["_divergence_flag"] = True
+            
+        # Bug 2 Synthesis Step & Overwrite final_answer
+        majority_conclusion = str(selected.get("final_answer", "")).strip()
+        final_conclusions = [str(c.get("final_answer", "")).strip() for c in candidates]
+        
+        if self_consistency == 1.0:
+            synthesis_content = f"Samples 1-3 compared. Consensus Reached: {majority_conclusion}"
+            selected["final_answer"] = majority_conclusion
+        else:
+            dissenting_list = [c for c in final_conclusions if c.lower() != majority_conclusion.lower()]
+            dissent = dissenting_list[0] if dissenting_list else "No clear dissent."
+            synthesis_content = f"Samples 1-3 compared. Divergence detected.\nMajority conclusion: {majority_conclusion}\nDissenting sample conclusion: {dissent}"
+            selected["final_answer"] = synthesis_content
+
+        merged_steps.append({
+            "step_index": len(merged_steps) + 1,
+            "content": f"[Synthesis] {synthesis_content}",
+            "assumptions": []
+        })
+        selected["reasoning_steps"] = merged_steps
+            
         return selected
 
     async def generate_for_self_consistency(
